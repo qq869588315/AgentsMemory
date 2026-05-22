@@ -1,0 +1,17 @@
+[paths]
+am_data_root = "E:\\work\\AM-data"
+am_global_dir = "{am_data_root}\\am-global"
+am_projects_dir = "{am_data_root}\\am-projects"
+am_secrets_dir = "{am_data_root}\\am-secrets"
+am_locks_dir = "{am_data_root}\\am-locks"
+
+[context]
+global_rules_budget_bytes = "2048"
+project_rules_budget_bytes = "4096"
+session_budget_bytes = "4096"
+retrieved_memory_budget_bytes = "12288"
+
+[performance]
+get_context_p95_ms = "300"
+checkpoint_p95_ms = "150"
+search_p95_ms = "250"
