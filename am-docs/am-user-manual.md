@@ -94,6 +94,12 @@ node am-src/am-cli.mjs install-rules --am-data-root E:\work\AM-data --target cur
 
 如果这些文件已经存在，agents-memory 只会在末尾追加托管块，不会修改、重排或覆盖原内容。追加前会备份到 `am-backups`。
 
+查看项目活跃任务：
+
+```powershell
+node am-src/am-cli.mjs active list --am-data-root E:\work\AM-data --project sdcr
+```
+
 ## 数据存在哪里
 
 默认数据结构：
@@ -119,11 +125,37 @@ session 状态在：
 E:\work\AM-data\am-projects\<project-id>\am-sessions\<session-id>\
 ```
 
+## 多 agent 并行工作
+
+agents-memory 不应该用一个项目级 hot 文件代表唯一当前任务。多个 agent 同时处理不同工作目录或不同任务时，每个 agent/session/task/worktree 都应该有自己的 session hot：
+
+```text
+E:\work\AM-data\am-projects\<project-id>\am-sessions\<session-id>\am-session.md
+```
+
+项目级只维护一个活跃任务索引，后续会提供：
+
+```powershell
+node am-src/am-cli.mjs active list --project <project-id>
+node am-src/am-cli.mjs active update --project <project-id> --session <session-id>
+node am-src/am-cli.mjs active complete --project <project-id> --session <session-id>
+```
+
+这样新 agent 可以先看项目里有哪些活跃任务，再决定读取哪个 session hot；任务完成后再把结果 `promote` 到项目 warm/cold。
+
 ## 敏感信息
 
 敏感信息应放在 `am-secrets` 中。普通记忆里只能保存 `secret_ref`，不要保存真实密码、token、cookie、密钥等明文。
 
-当前原型只实现了 `secret get`，后续会补 `secret set/list`。
+常用命令：
+
+```powershell
+node am-src/am-cli.mjs secret get --am-data-root E:\work\AM-data --ref sdcr.mysql.dev
+node am-src/am-cli.mjs secret set --am-data-root E:\work\AM-data --ref sdcr.mysql.dev --value "..."
+node am-src/am-cli.mjs secret list --am-data-root E:\work\AM-data --prefix sdcr
+node am-src/am-cli.mjs secret update --am-data-root E:\work\AM-data --ref sdcr.mysql.dev --value "..."
+node am-src/am-cli.mjs secret remove --am-data-root E:\work\AM-data --ref sdcr.mysql.dev
+```
 
 ## 故障排查
 
@@ -141,6 +173,14 @@ node am-src/am-cli.mjs rebuild-index --am-data-root E:\work\AM-data --project <p
 
 如果 `doctor` 显示 `sqlite_fts5` 不可用，工具会降级使用普通 SQLite 或文件扫描，功能仍可用，只是搜索性能可能降低。
 
+如果 `doctor` 显示 `ripgrep` 可用，`search` 会优先用它检索记忆源文件。`ripgrep` 对文件路径、命令、报错、API 名、配置键等精确内容通常比向量 RAG 更可靠；后续即使增加向量检索，也只会作为辅助召回，而不是替代精确检索。
+
+要看更详细的命中情况，可以加 `--debug`：
+
+```powershell
+node am-src/am-cli.mjs search --am-data-root E:\work\AM-data --project sdcr --scope project --query "关键词" --debug
+```
+
 ## 迁移旧记忆
 
 v1 完成后会提供旧记忆迁移命令，用于把当前已有的 hot/warm/cold Markdown 记忆导入 agents-memory 新结构。
@@ -149,6 +189,12 @@ v1 完成后会提供旧记忆迁移命令，用于把当前已有的 hot/warm/c
 
 ```powershell
 node am-src/am-cli.mjs migrate legacy --am-data-root E:\work\AM-data --project sdcr --session imported-legacy --hot <hot.md> --warm <warm.md> --cold <cold.md>
+```
+
+也可以先 dry-run：
+
+```powershell
+node am-src/am-cli.mjs migrate legacy --am-data-root E:\work\AM-data --project sdcr --session imported-legacy --hot <hot.md> --warm <warm.md> --cold <cold.md> --dry-run
 ```
 
 迁移原则：
@@ -161,6 +207,12 @@ node am-src/am-cli.mjs migrate legacy --am-data-root E:\work\AM-data --project s
 - 迁移后会重建索引。
 - 迁移报告会写入 `am-migration-report.md`。
 - 疑似密码、token、cookie、密钥等敏感信息不会自动导入普通记忆。
+- checkpoint 也支持从 `--state-file` 或标准输入读取长文本，避免 PowerShell 转义问题。
+- `doc-check` 用来检查 README、开发说明、用户手册和 roadmap 是否同步了关键命令和策略。
+
+```powershell
+node am-src/am-cli.mjs doc-check
+```
 
 ## 当前限制
 

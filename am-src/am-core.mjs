@@ -57,7 +57,16 @@ export async function writeTextAtomic(filePath, content) {
   await ensureDir(path.dirname(filePath));
   const tempPath = `${filePath}.am-tmp-${process.pid}-${Date.now()}`;
   await fs.writeFile(tempPath, content, 'utf8');
-  await fs.rename(tempPath, filePath);
+  try {
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    if (error.code === 'EEXIST' || error.code === 'EPERM') {
+      await fs.rm(filePath, { force: true });
+      await fs.rename(tempPath, filePath);
+      return;
+    }
+    throw error;
+  }
 }
 
 export async function appendLine(filePath, line) {
@@ -173,6 +182,7 @@ export function pathsFor(amDataRoot, projectId = undefined, sessionId = undefine
     projectsDir,
     projectDir,
     projectConfig: projectDir ? path.join(projectDir, 'am-project.toml') : undefined,
+    projectActiveFile: projectDir ? path.join(projectDir, 'am-active.json') : undefined,
     projectRulesDir: projectDir ? path.join(projectDir, 'am-rules') : undefined,
     projectContextDir: projectDir ? path.join(projectDir, 'am-context') : undefined,
     projectMemoryDir: projectDir ? path.join(projectDir, 'am-memory') : undefined,
@@ -186,26 +196,37 @@ export function pathsFor(amDataRoot, projectId = undefined, sessionId = undefine
   };
 }
 
-export async function acquireLock(lockPath, purpose) {
+export async function acquireLock(lockPath, purpose, options = {}) {
   await ensureDir(path.dirname(lockPath));
+  const timeoutMs = Number(options.timeoutMs || 5000);
+  const retryMs = Number(options.retryMs || 25);
+  const staleMs = Number(options.staleMs || 10 * 60 * 1000);
+  const startedAt = Date.now();
   const content = JSON.stringify({ owner: 'agents-memory', purpose, pid: process.pid, createdAt: new Date().toISOString() });
-  try {
-    const handle = await fs.open(lockPath, 'wx');
-    await handle.writeFile(content, 'utf8');
-    await handle.close();
-    return async () => {
-      try {
-        await fs.unlink(lockPath);
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-      }
-    };
-  } catch (error) {
-    if (error.code === 'EEXIST') {
+  while (true) {
+    try {
+      const handle = await fs.open(lockPath, 'wx');
+      await handle.writeFile(content, 'utf8');
+      await handle.close();
+      return async () => {
+        try {
+          await fs.unlink(lockPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
       const lockContent = await readText(lockPath, '');
-      throw new AmError(`写锁已存在：${lockPath}\n${lockContent}`, 'AM_LOCK_BUSY');
+      if (isStaleLock(lockContent, staleMs)) {
+        await fs.rm(lockPath, { force: true });
+        continue;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        throw new AmError(`写锁已存在：${lockPath}\n${lockContent}`, 'AM_LOCK_BUSY');
+      }
+      await sleep(retryMs);
     }
-    throw error;
   }
 }
 
@@ -249,6 +270,7 @@ export async function registerProject(options) {
     await ensureDir(p.projectContextDir);
     await ensureDir(p.projectMemoryDir);
     await ensureDir(p.projectSessionsDir);
+    await ensureActiveIndex(p.projectActiveFile, projectId);
     await writeTextAtomic(p.projectConfig, renderToml({
       project: {
         id: projectId,
@@ -285,6 +307,8 @@ export async function startSession(options) {
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
   const agentName = options.agent || 'agent';
+  const taskName = options.task || options['task-name'] || '';
+  const worktree = options.worktree || options['worktree-root'] || '';
   const sessionId = options.session || `${agentName}-${Date.now()}`;
   const p = pathsFor(amDataRoot, projectId, sessionId, undefined, agentName);
   if (!(await pathExists(p.projectConfig))) {
@@ -313,6 +337,19 @@ export async function startSession(options) {
     agent: agentName,
     created_at: new Date().toISOString(),
   }));
+  await upsertActiveEntry(p, {
+    project_id: projectId,
+    session_id: sessionId,
+    agent: agentName,
+    task: taskName,
+    worktree,
+    status: 'active',
+    summary: `session started: ${agentName}`,
+    session_file: p.sessionFile,
+    checkpoints_file: p.checkpointsFile,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
   return { projectId, sessionId, sessionFile: p.sessionFile };
 }
 
@@ -325,19 +362,20 @@ export async function checkpoint(options) {
   const sessionId = options.session;
   const reason = options.reason || 'checkpoint';
   const p = pathsFor(amDataRoot, projectId, sessionId);
-  const state = options.state || options.message || '';
+  const state = await readCheckpointState(options);
   const sessionText = state || await readText(p.sessionFile, '');
   const release = await acquireLock(path.join(p.locksDir, `${projectId}.am.lock`), `checkpoint ${projectId}/${sessionId}`);
   try {
     await ensureDir(p.sessionDir);
     if (state) await writeTextAtomic(p.sessionFile, ensureMarkdownTitle(state, `${projectId} Session`));
+    const now = new Date().toISOString();
     const event = {
       type: 'checkpoint',
       project_id: projectId,
       session_id: sessionId,
       reason,
       state: compactText(sessionText, 12000),
-      created_at: new Date().toISOString(),
+      created_at: now,
     };
     await appendLine(p.checkpointsFile, JSON.stringify(event));
     await appendLine(path.join(p.projectMemoryDir, 'am-cold.events.jsonl'), JSON.stringify(event));
@@ -350,6 +388,17 @@ export async function checkpoint(options) {
       body: event.state,
       source_path: p.checkpointsFile,
       created_at: event.created_at,
+    });
+    await upsertActiveEntry(p, {
+      project_id: projectId,
+      session_id: sessionId,
+      status: options.status || 'active',
+      summary: summarizeState(sessionText),
+      last_reason: reason,
+      last_checkpoint_at: now,
+      session_file: p.sessionFile,
+      checkpoints_file: p.checkpointsFile,
+      updated_at: now,
     });
     return { projectId, sessionId, reason, checkpointsFile: p.checkpointsFile };
   } finally {
@@ -370,11 +419,12 @@ export async function promote(options) {
     const sessionText = await readText(p.sessionFile, '');
     const warmFile = path.join(p.projectMemoryDir, 'am-warm.md');
     const coldFile = path.join(p.projectMemoryDir, 'am-cold.events.jsonl');
+    const now = new Date().toISOString();
     const warmEntry = [
       '',
       `## Session ${sessionId} 晋升记录`,
       '',
-      `- 时间：${new Date().toISOString()}`,
+      `- 时间：${now}`,
       `- 来源：${p.sessionFile}`,
       '- 摘要：',
       indentLines(compactText(sessionText, 4000), '  '),
@@ -386,7 +436,7 @@ export async function promote(options) {
       project_id: projectId,
       session_id: sessionId,
       summary: compactText(sessionText, 8000),
-      created_at: new Date().toISOString(),
+      created_at: now,
     };
     await appendLine(coldFile, JSON.stringify(event));
     await indexDocument(p.projectIndex, {
@@ -398,6 +448,17 @@ export async function promote(options) {
       body: event.summary,
       source_path: warmFile,
       created_at: event.created_at,
+    });
+    await upsertActiveEntry(p, {
+      project_id: projectId,
+      session_id: sessionId,
+      status: 'completed',
+      summary: summarizeState(sessionText),
+      completed_at: now,
+      promoted_at: now,
+      session_file: p.sessionFile,
+      checkpoints_file: p.checkpointsFile,
+      updated_at: now,
     });
     return { projectId, sessionId, warmFile, coldFile };
   } finally {
@@ -414,6 +475,7 @@ export async function getContext(options) {
   const projectId = options.project;
   const p = pathsFor(amDataRoot, projectId, sessionId);
   const projectRules = await readText(path.join(p.projectRulesDir, 'am-rules.md'), '');
+  const activeIndex = await readText(p.projectActiveFile, '');
   const warm = await readText(path.join(p.projectMemoryDir, 'am-warm.md'), '');
   const session = sessionId ? await readText(p.sessionFile, '') : '';
   const results = await search({ ...options, scope: 'global,project', query, limit: options.limit || 8 });
@@ -422,6 +484,9 @@ export async function getContext(options) {
     '',
     '## Project Rules',
     compactText(projectRules, 3000) || '- 无项目规则摘要。',
+    '',
+    '## Project Active Index',
+    compactText(activeIndex, 3000) || '- 无 active 索引。',
     '',
     '## Session State',
     compactText(session, 4000) || '- 无 session 状态。',
@@ -441,20 +506,47 @@ export async function search(options) {
   const limit = Number(options.limit || 10);
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const debug = Boolean(options.debug);
   const scopes = String(options.scope || 'global,project').split(',').map((scope) => scope.trim());
   const projectId = options.project;
   const p = pathsFor(amDataRoot, projectId);
   const indexFiles = [];
-  if (scopes.includes('global')) indexFiles.push(p.globalIndex);
-  if (scopes.includes('project') && projectId) indexFiles.push(p.projectIndex);
+  const searchDirs = [];
+  if (scopes.includes('global')) {
+    indexFiles.push(p.globalIndex);
+    searchDirs.push(p.globalDir);
+  }
+  if (scopes.includes('project') && projectId) {
+    indexFiles.push(p.projectIndex);
+    searchDirs.push(p.projectDir);
+  }
   const items = [];
+  const metrics = { ripgrep: 0, sqlite: 0, fallback: 0 };
+  for (const searchDir of searchDirs) {
+    const rgItems = await searchWithRipgrep(searchDir, query, limit);
+    metrics.ripgrep += rgItems.length;
+    items.push(...rgItems);
+  }
+  if (items.length >= limit) {
+    return buildSearchResult(query, dedupeSearchItems(items), limit, debug, metrics, 'ripgrep-first');
+  }
   for (const indexFile of indexFiles) {
-    items.push(...await searchIndex(indexFile, query, limit));
+    try {
+      const sqliteItems = await searchIndex(indexFile, query, limit);
+      metrics.sqlite += sqliteItems.length;
+      items.push(...sqliteItems);
+    } catch {
+      // SQLite is a rebuildable index layer; search must still work from source files.
+    }
   }
-  if (!items.length && projectId) {
-    items.push(...await fallbackSearchProject(p.projectDir, query, limit));
+  if (!items.length) {
+    for (const searchDir of searchDirs) {
+      const fallbackItems = await fallbackSearchProject(searchDir, query, limit);
+      metrics.fallback += fallbackItems.length;
+      items.push(...fallbackItems);
+    }
   }
-  return { query, items: items.slice(0, limit) };
+  return buildSearchResult(query, dedupeSearchItems(items), limit, debug, metrics, 'hybrid');
 }
 
 export async function rebuildIndex(options) {
@@ -489,15 +581,64 @@ export async function rebuildIndex(options) {
 
 export async function secretGet(options) {
   requireOption(options, 'ref');
-  const userConfig = await loadUserConfig();
-  const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot);
-  const secretFile = path.join(p.secretsDir, 'am-secrets.local.json');
-  const content = await readText(secretFile, '{}');
-  const json = JSON.parse(content || '{}');
-  const value = options.ref.split('.').reduce((acc, key) => acc?.[key], json);
+  const { store } = await loadSecretStore(options);
+  const value = resolveByRef(store, options.ref);
   if (value === undefined) throw new AmError(`未找到 secret_ref：${options.ref}`, 'AM_SECRET_NOT_FOUND');
   return { ref: options.ref, value };
+}
+
+export async function secretSet(options) {
+  requireOption(options, 'ref');
+  const value = await readRequestedText(options, 'value', 'value-file');
+  const { secretFile, store, release } = await lockAndLoadSecretStore(options, 'set secret');
+  try {
+    setByRef(store, options.ref, value);
+    await saveSecretStore(secretFile, store);
+    return { ref: options.ref, secretFile };
+  } finally {
+    await release();
+  }
+}
+
+export async function secretList(options) {
+  const { store, release } = await lockAndLoadSecretStore(options, 'list secrets');
+  try {
+    const prefix = String(options.prefix || '').trim();
+    const refs = flattenRefs(store).filter((ref) => !prefix || ref === prefix || ref.startsWith(`${prefix}.`)).map((ref) => ({ ref }));
+    return { items: refs };
+  } finally {
+    await release();
+  }
+}
+
+export async function secretUpdate(options) {
+  requireOption(options, 'ref');
+  const value = await readRequestedText(options, 'value', 'value-file');
+  const { secretFile, store, release } = await lockAndLoadSecretStore(options, 'update secret');
+  try {
+    if (resolveByRef(store, options.ref) === undefined) {
+      throw new AmError(`未找到 secret_ref：${options.ref}`, 'AM_SECRET_NOT_FOUND');
+    }
+    setByRef(store, options.ref, value);
+    await saveSecretStore(secretFile, store);
+    return { ref: options.ref, secretFile };
+  } finally {
+    await release();
+  }
+}
+
+export async function secretRemove(options) {
+  requireOption(options, 'ref');
+  const { secretFile, store, release } = await lockAndLoadSecretStore(options, 'remove secret');
+  try {
+    if (!deleteByRef(store, options.ref)) {
+      throw new AmError(`未找到 secret_ref：${options.ref}`, 'AM_SECRET_NOT_FOUND');
+    }
+    await saveSecretStore(secretFile, store);
+    return { ref: options.ref, secretFile };
+  } finally {
+    await release();
+  }
 }
 
 export async function doctor(options = {}) {
@@ -519,7 +660,196 @@ export async function doctor(options = {}) {
     await ensureDir(path.dirname(probeIndex));
     checks.push({ name: 'sqlite_fts5', ok: sqliteSupportsFts5(probeIndex), detail: sqliteSupportsFts5(probeIndex) ? 'available' : 'not available; LIKE/file fallback will be used' });
   }
+  checks.push({ name: 'ripgrep', ok: hasRipgrep(), detail: hasRipgrep() ? 'available; live lexical search enabled' : 'not found; SQLite/file fallback will be used' });
   return { amDataRoot, checks };
+}
+
+export async function migrateLegacy(options) {
+  requireOption(options, 'project');
+  requireOption(options, 'session');
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const projectId = options.project;
+  const sessionId = options.session;
+  const p = pathsFor(amDataRoot, projectId, sessionId);
+  if (!(await pathExists(p.projectConfig))) {
+    throw new AmError(`项目未注册：${projectId}`, 'AM_PROJECT_NOT_FOUND');
+  }
+  const sources = {
+    hot: options.hot ? path.resolve(options.hot) : '',
+    warm: options.warm ? path.resolve(options.warm) : '',
+    cold: options.cold ? path.resolve(options.cold) : '',
+  };
+  const dryRun = Boolean(options.dryRun || options['dry-run']);
+  const hotText = sources.hot ? await readText(sources.hot, '') : '';
+  const warmText = sources.warm ? await readText(sources.warm, '') : '';
+  const coldText = sources.cold ? await readText(sources.cold, '') : '';
+  const plan = buildLegacyMigrationPlan({ projectId, sessionId, p, sources, hotText, warmText, coldText });
+  if (dryRun) {
+    return { dryRun: true, projectId, sessionId, plan };
+  }
+  const release = await acquireLock(path.join(p.locksDir, `${projectId}.am.lock`), `migrate legacy ${projectId}/${sessionId}`);
+  try {
+    await ensureDir(p.sessionDir);
+    await ensureDir(p.projectMemoryDir);
+    await ensureDir(path.dirname(p.checkpointsFile));
+    const now = new Date().toISOString();
+    if (sources.hot) {
+      await writeTextAtomic(p.sessionFile, ensureMarkdownTitle(stripSensitiveLines(hotText).text || '', `${projectId} Session`));
+      const event = {
+        type: 'legacy_hot_import',
+        project_id: projectId,
+        session_id: sessionId,
+        source_path: sources.hot,
+        imported_at: now,
+        summary: summarizeState(hotText),
+      };
+      await appendLine(p.checkpointsFile, JSON.stringify(event));
+      await indexDocument(p.projectIndex, {
+        scope: 'session',
+        project_id: projectId,
+        session_id: sessionId,
+        kind: 'legacy_hot_import',
+        title: `Legacy hot import ${sessionId}`,
+        body: event.summary,
+        source_path: p.sessionFile,
+        created_at: now,
+      });
+    }
+    const warmFile = path.join(p.projectMemoryDir, 'am-warm.md');
+    if (sources.warm) {
+      const cleaned = stripSensitiveLines(warmText);
+      const warmEntry = [
+        '',
+        `## Legacy Warm Import ${sessionId}`,
+        '',
+        `- 时间：${now}`,
+        `- 来源：${sources.warm}`,
+        `- 跳过行数：${cleaned.skippedCount}`,
+        '- 内容：',
+        indentLines(cleaned.text || '- 无可导入内容。', '  '),
+        '',
+      ].join('\n');
+      await fs.appendFile(warmFile, warmEntry, 'utf8');
+      await indexDocument(p.projectIndex, {
+        scope: 'project',
+        project_id: projectId,
+        session_id: sessionId,
+        kind: 'legacy_warm_import',
+        title: `Legacy warm import ${sessionId}`,
+        body: summarizeState(cleaned.text),
+        source_path: warmFile,
+        created_at: now,
+      });
+    }
+    const coldFile = path.join(p.projectMemoryDir, 'am-cold.events.jsonl');
+    const coldEvents = parseLegacyColdEvents(coldText, sources.cold, projectId, sessionId);
+    for (const event of coldEvents.events) {
+      await appendLine(coldFile, JSON.stringify(event));
+    }
+    for (const item of coldEvents.indexItems) {
+      await indexDocument(p.projectIndex, item);
+    }
+    const report = buildLegacyMigrationReport({ projectId, sessionId, sources, hotText, warmText, coldText, plan, coldEvents });
+    const reportPath = path.join(p.projectMemoryDir, 'am-migration-report.md');
+    await writeTextAtomic(reportPath, report);
+    await rebuildIndex({ project: projectId, 'am-data-root': amDataRoot });
+    await upsertActiveEntry(p, {
+      project_id: projectId,
+      session_id: sessionId,
+      status: 'completed',
+      summary: `legacy migration completed: ${sessionId}`,
+      completed_at: now,
+      updated_at: now,
+      session_file: p.sessionFile,
+      checkpoints_file: p.checkpointsFile,
+    });
+    return { projectId, sessionId, reportPath, plan };
+  } finally {
+    await release();
+  }
+}
+
+export async function docCheck() {
+  const files = [
+    path.resolve('README.md'),
+    path.resolve('am-docs/am-developer-guide.md'),
+    path.resolve('am-docs/am-user-manual.md'),
+    path.resolve('am-docs/am-architecture.md'),
+    path.resolve('am-docs/am-implementation-standard.md'),
+    path.resolve('am-docs/am-roadmap.md'),
+  ];
+  const contents = {};
+  for (const file of files) contents[file] = await readText(file, '');
+  const requirements = [
+    ['am active list', ['README.md', 'am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md']],
+    ['secret set', ['README.md', 'am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md']],
+    ['migrate legacy', ['README.md', 'am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md', 'am-docs/am-roadmap.md']],
+    ['doc-check', ['README.md', 'am-docs/am-developer-guide.md', 'am-docs/am-user-manual.md', 'am-docs/am-roadmap.md']],
+    ['state-file', ['am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md', 'am-docs/am-roadmap.md']],
+    ['ripgrep', ['am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md', 'am-docs/am-implementation-standard.md']],
+  ];
+  const missing = [];
+  for (const [needle, candidateFiles] of requirements) {
+    if (!candidateFiles.some((file) => contents[path.resolve(file)].includes(needle))) {
+      missing.push(needle);
+    }
+  }
+  return { ok: missing.length === 0, missing, checkedFiles: files };
+}
+
+export async function activeList(options) {
+  requireOption(options, 'project');
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const p = pathsFor(amDataRoot, options.project);
+  const index = await loadActiveIndex(p.projectActiveFile, options.project);
+  return { projectId: options.project, updatedAt: index.updated_at || '', entries: index.entries || [] };
+}
+
+export async function activeUpdate(options) {
+  requireOption(options, 'project');
+  requireOption(options, 'session');
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const p = pathsFor(amDataRoot, options.project, options.session);
+  const now = new Date().toISOString();
+  const entry = await upsertActiveEntry(p, {
+    project_id: options.project,
+    session_id: options.session,
+    agent: options.agent,
+    task: options.task || options['task-name'] || '',
+    worktree: options.worktree || '',
+    status: options.status || 'active',
+    summary: options.summary || options.message || '',
+    session_file: p.sessionFile,
+    checkpoints_file: p.checkpointsFile,
+    updated_at: now,
+  });
+  return { projectId: options.project, entry };
+}
+
+export async function activeComplete(options) {
+  requireOption(options, 'project');
+  requireOption(options, 'session');
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const p = pathsFor(amDataRoot, options.project, options.session);
+  const now = new Date().toISOString();
+  const entry = await upsertActiveEntry(p, {
+    project_id: options.project,
+    session_id: options.session,
+    agent: options.agent,
+    task: options.task || options['task-name'] || '',
+    worktree: options.worktree || '',
+    status: 'completed',
+    summary: options.summary || options.message || '',
+    completed_at: now,
+    session_file: p.sessionFile,
+    checkpoints_file: p.checkpointsFile,
+    updated_at: now,
+  });
+  return { projectId: options.project, entry };
 }
 
 export async function installRules(options) {
@@ -587,11 +917,11 @@ export async function indexDocument(indexFile, doc) {
 export async function searchIndex(indexFile, query, limit) {
   if (!hasSqlite() || !(await pathExists(indexFile))) return [];
   const safeLimit = Number.isFinite(limit) ? limit : 10;
-  const matchExpr = query ? query.replace(/"/g, ' ') : '';
+  const terms = splitSearchTerms(query);
+  const matchExpr = terms.map((term) => `"${term.replace(/"/g, '""')}"`).join(' AND ');
   const hasFts = sqliteHasTable(indexFile, 'am_documents_fts');
-  const likeTerms = String(query || '').split(/\s+/).map((term) => term.trim()).filter(Boolean);
-  const likeWhere = likeTerms.length
-    ? likeTerms.map((term) => {
+  const likeWhere = terms.length
+    ? terms.map((term) => {
       const likeExpr = `%${term.replace(/[%_]/g, ' ')}%`;
       return `(title LIKE ${sqlValue(likeExpr)} OR body LIKE ${sqlValue(likeExpr)})`;
     }).join(' AND ')
@@ -604,8 +934,77 @@ export async function searchIndex(indexFile, query, limit) {
   const output = runSqlite(indexFile, sql, true);
   return output.split(/\r?\n/).filter(Boolean).map((line) => {
     const [kind, title, body, source_path, created_at] = line.split('\t');
-    return { kind, title, body, source_path, created_at };
-  });
+    return { kind, title, body, source_path, created_at, backend: 'sqlite' };
+  }).filter((item) => item.kind && item.title && item.body !== undefined && item.source_path && path.isAbsolute(item.source_path));
+}
+
+export async function searchWithRipgrep(searchDir, query, limit) {
+  if (!searchDir || !(await pathExists(searchDir)) || !hasRipgrep()) return [];
+  const terms = splitSearchTerms(query);
+  if (!terms.length) return [];
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, limit) : 10;
+  const args = [
+    '--json',
+    '--ignore-case',
+    '--fixed-strings',
+    '--line-number',
+    '--max-count',
+    String(Math.max(20, safeLimit * 3)),
+    '--max-filesize',
+    '2M',
+    '--glob',
+    '*.md',
+    '--glob',
+    '*.jsonl',
+    '--glob',
+    '*.toml',
+    '--glob',
+    '!am-index.sqlite',
+    '--glob',
+    '!*.am-tmp-*',
+  ];
+  for (const term of terms.slice(0, 8)) {
+    args.push('-e', term);
+  }
+  args.push(searchDir);
+  const result = spawnSync('rg', args, { encoding: 'utf8' });
+  if (result.status !== 0 || !result.stdout) return [];
+
+  const byFile = new Map();
+  for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.type !== 'match') continue;
+    const filePath = event.data?.path?.text;
+    if (!filePath) continue;
+    const lineNumber = event.data?.line_number;
+    const lineText = String(event.data?.lines?.text || '').trimEnd();
+    const entry = byFile.get(filePath) || {
+      filePath,
+      title: path.basename(filePath),
+      snippets: [],
+      score: 0,
+    };
+    if (lineText) entry.snippets.push(`${lineNumber}: ${lineText}`);
+    entry.score += Math.max(1, event.data?.submatches?.length || 0);
+    byFile.set(filePath, entry);
+  }
+
+  return [...byFile.values()]
+    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
+    .slice(0, safeLimit)
+    .map((entry) => ({
+      kind: 'rg',
+      title: entry.title,
+      body: compactText(entry.snippets.slice(0, 12).join('\n'), 2000),
+      source_path: entry.filePath,
+      created_at: '',
+      backend: 'ripgrep',
+    }));
 }
 
 function sqliteSupportsFts5(indexFile) {
@@ -629,17 +1028,20 @@ function sqliteHasTable(indexFile, tableName) {
 export async function fallbackSearchProject(projectDir, query, limit) {
   if (!projectDir || !(await pathExists(projectDir))) return [];
   const files = await listFiles(projectDir);
-  const needle = String(query || '').toLowerCase();
+  const terms = splitSearchTerms(query).map((term) => term.toLowerCase());
   const items = [];
   for (const filePath of files.filter((file) => /\.(md|jsonl|toml)$/i.test(file))) {
     const content = await readText(filePath, '');
-    if (!needle || content.toLowerCase().includes(needle)) {
+    const lowerContent = content.toLowerCase();
+    const matches = !terms.length || terms.every((term) => lowerContent.includes(term));
+    if (matches) {
       items.push({
         kind: 'file',
         title: path.basename(filePath),
         body: compactText(content, 2000),
         source_path: filePath,
         created_at: '',
+        backend: 'file-scan',
       });
     }
     if (items.length >= limit) break;
@@ -672,6 +1074,90 @@ function hasSqlite() {
   return result.status === 0;
 }
 
+function hasRipgrep() {
+  const result = spawnSync('rg', ['--version'], { encoding: 'utf8' });
+  return result.status === 0;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isStaleLock(lockContent, staleMs) {
+  try {
+    const parsed = JSON.parse(lockContent || '{}');
+    if (!parsed.createdAt) return false;
+    const createdAt = Date.parse(parsed.createdAt);
+    return Number.isFinite(createdAt) && Date.now() - createdAt > staleMs;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureActiveIndex(activeFile, projectId) {
+  await ensureDir(path.dirname(activeFile));
+  if (await pathExists(activeFile)) return;
+  await writeTextAtomic(activeFile, `${JSON.stringify({
+    project_id: projectId,
+    updated_at: new Date().toISOString(),
+    entries: [],
+  }, null, 2)}\n`);
+}
+
+async function loadActiveIndex(activeFile, projectId) {
+  const content = await readText(activeFile, '');
+  if (!content.trim()) {
+    return { project_id: projectId, updated_at: new Date().toISOString(), entries: [] };
+  }
+  try {
+    const parsed = JSON.parse(content);
+    parsed.project_id ||= projectId;
+    parsed.updated_at ||= new Date().toISOString();
+    parsed.entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+    return parsed;
+  } catch {
+    return { project_id: projectId, updated_at: new Date().toISOString(), entries: [] };
+  }
+}
+
+async function saveActiveIndex(activeFile, activeIndex) {
+  await writeTextAtomic(activeFile, `${JSON.stringify({
+    ...activeIndex,
+    updated_at: new Date().toISOString(),
+    entries: Array.isArray(activeIndex.entries) ? activeIndex.entries : [],
+  }, null, 2)}\n`);
+}
+
+function activeEntryKey(entry) {
+  return [entry.session_id || '', entry.task || '', entry.worktree || ''].join('\u0000');
+}
+
+async function upsertActiveEntry(p, entry) {
+  if (!p.projectActiveFile) return entry;
+  const lockName = `${entry.project_id || 'project'}.am-active.lock`;
+  const release = await acquireLock(path.join(p.locksDir, lockName), `active index ${entry.project_id || ''}/${entry.session_id || ''}`);
+  try {
+    const activeIndex = await loadActiveIndex(p.projectActiveFile, entry.project_id);
+    const now = new Date().toISOString();
+    const key = activeEntryKey(entry);
+    const existingIndex = activeIndex.entries.findIndex((item) => activeEntryKey(item) === key);
+    const nextEntry = {
+      ...(existingIndex >= 0 ? activeIndex.entries[existingIndex] : {}),
+      ...entry,
+      created_at: existingIndex >= 0 ? activeIndex.entries[existingIndex].created_at || entry.created_at || now : entry.created_at || now,
+      updated_at: entry.updated_at || now,
+    };
+    if (existingIndex >= 0) activeIndex.entries[existingIndex] = nextEntry;
+    else activeIndex.entries.push(nextEntry);
+    activeIndex.project_id = entry.project_id || activeIndex.project_id;
+    activeIndex.updated_at = now;
+    await saveActiveIndex(p.projectActiveFile, activeIndex);
+    return nextEntry;
+  } finally {
+    await release();
+  }
+}
+
 function runSqlite(indexFile, sql, capture = false) {
   const args = capture
     ? ['-separator', '\t', indexFile, sql]
@@ -696,6 +1182,297 @@ function compactText(value, maxLength) {
   const text = String(value || '').trim();
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength)}\n... [truncated by agents-memory]`;
+}
+
+function splitSearchTerms(query) {
+  return [...new Set(String(query || '').split(/\s+/).map((term) => term.trim()).filter(Boolean))];
+}
+
+async function readCheckpointState(options) {
+  if (Object.prototype.hasOwnProperty.call(options, 'state')) {
+    return String(options.state || '');
+  }
+  if (options['state-file'] || options.stateFile) {
+    return await readText(path.resolve(options['state-file'] || options.stateFile), '');
+  }
+  if (options.stdin) {
+    return await fs.readFile(0, 'utf8');
+  }
+  if (options.message) {
+    return String(options.message || '');
+  }
+  return '';
+}
+
+async function readRequestedText(options, textKey, fileKey) {
+  if (Object.prototype.hasOwnProperty.call(options, textKey)) {
+    return String(options[textKey] || '');
+  }
+  if (options[fileKey] || options[`${textKey}File`]) {
+    return await readText(path.resolve(options[fileKey] || options[`${textKey}File`]), '');
+  }
+  if (options.stdin) {
+    return await fs.readFile(0, 'utf8');
+  }
+  return '';
+}
+
+async function loadJson(filePath, fallback = {}) {
+  const content = await readText(filePath, '');
+  if (!content.trim()) return fallback;
+  try {
+    return JSON.parse(content);
+  } catch {
+    return fallback;
+  }
+}
+
+async function lockAndLoadSecretStore(options, purpose) {
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const p = pathsFor(amDataRoot);
+  const secretFile = path.join(p.secretsDir, 'am-secrets.local.json');
+  await ensureDir(p.secretsDir);
+  const release = await acquireLock(path.join(p.locksDir, 'am-secrets.am.lock'), purpose);
+  const store = await loadJson(secretFile, {});
+  return { secretFile, store, release };
+}
+
+async function loadSecretStore(options) {
+  const userConfig = await loadUserConfig();
+  const amDataRoot = resolveAmDataRoot(options, userConfig);
+  const p = pathsFor(amDataRoot);
+  const secretFile = path.join(p.secretsDir, 'am-secrets.local.json');
+  const store = await loadJson(secretFile, {});
+  return { secretFile, store };
+}
+
+async function saveSecretStore(secretFile, store) {
+  await writeTextAtomic(secretFile, `${JSON.stringify(store, null, 2)}\n`);
+}
+
+function resolveByRef(store, ref) {
+  return String(ref || '').split('.').reduce((acc, key) => acc?.[key], store);
+}
+
+function setByRef(store, ref, value) {
+  const parts = String(ref || '').split('.').filter(Boolean);
+  if (!parts.length) throw new AmError('secret_ref 不能为空', 'AM_BAD_SECRET_REF');
+  let cursor = store;
+  for (const part of parts.slice(0, -1)) {
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) cursor[part] = {};
+    cursor = cursor[part];
+  }
+  cursor[parts.at(-1)] = value;
+}
+
+function deleteByRef(store, ref) {
+  const parts = String(ref || '').split('.').filter(Boolean);
+  if (!parts.length) return false;
+  const parents = [];
+  let cursor = store;
+  for (const part of parts.slice(0, -1)) {
+    if (!cursor[part] || typeof cursor[part] !== 'object') return false;
+    parents.push([cursor, part]);
+    cursor = cursor[part];
+  }
+  if (!Object.prototype.hasOwnProperty.call(cursor, parts.at(-1))) return false;
+  delete cursor[parts.at(-1)];
+  for (let i = parents.length - 1; i >= 0; i -= 1) {
+    const [parent, key] = parents[i];
+    if (parent[key] && typeof parent[key] === 'object' && !Array.isArray(parent[key]) && !Object.keys(parent[key]).length) {
+      delete parent[key];
+    }
+  }
+  return true;
+}
+
+function flattenRefs(store, prefix = '') {
+  const refs = [];
+  for (const [key, value] of Object.entries(store || {})) {
+    const ref = prefix ? `${prefix}.${key}` : key;
+    if (value && typeof value === 'object' && !Array.isArray(value)) refs.push(...flattenRefs(value, ref));
+    else refs.push(ref);
+  }
+  return refs;
+}
+
+function summarizeState(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).filter((line) => !line.startsWith('#'));
+  return compactText(lines.slice(0, 8).join(' | '), 280);
+}
+
+function buildSearchResult(query, items, limit, debug, metrics, strategy) {
+  const limited = items.slice(0, limit);
+  const result = { query, items: limited };
+  if (debug) {
+    result.debug = {
+      strategy,
+      metrics,
+      returned: limited.length,
+      truncated: items.length > limit,
+    };
+  }
+  return result;
+}
+
+function buildLegacyMigrationPlan({ projectId, sessionId, p, sources, hotText, warmText, coldText }) {
+  return {
+    projectId,
+    sessionId,
+    sources: {
+      hot: sources.hot ? { source: sources.hot, target: p.sessionFile, lines: countLines(hotText) } : null,
+      warm: sources.warm ? { source: sources.warm, target: path.join(p.projectMemoryDir, 'am-warm.md'), lines: countLines(warmText) } : null,
+      cold: sources.cold ? { source: sources.cold, target: path.join(p.projectMemoryDir, 'am-cold.events.jsonl'), lines: countLines(coldText) } : null,
+    },
+  };
+}
+
+function buildLegacyMigrationReport({ projectId, sessionId, sources, hotText, warmText, coldText, plan, coldEvents }) {
+  const now = new Date().toISOString();
+  return [
+    '# agents-memory Legacy Migration Report',
+    '',
+    `- project_id: ${projectId}`,
+    `- session_id: ${sessionId}`,
+    `- generated_at: ${now}`,
+    '',
+    '## Sources',
+    `- hot: ${sources.hot || 'not provided'}`,
+    `- warm: ${sources.warm || 'not provided'}`,
+    `- cold: ${sources.cold || 'not provided'}`,
+    '',
+    '## Plan',
+    `- hot lines: ${plan.sources.hot?.lines ?? 0}`,
+    `- warm lines: ${plan.sources.warm?.lines ?? 0}`,
+    `- cold lines: ${plan.sources.cold?.lines ?? 0}`,
+    '',
+    '## Import Notes',
+    `- hot sensitive lines skipped: ${stripSensitiveLines(hotText).skippedCount}`,
+    `- warm sensitive lines skipped: ${stripSensitiveLines(warmText).skippedCount}`,
+    `- cold sensitive lines skipped: ${coldEvents.skippedCount}`,
+    '',
+    '## Summary',
+    `- hot imported: ${Boolean(sources.hot)}`,
+    `- warm imported: ${Boolean(sources.warm)}`,
+    `- cold imported events: ${coldEvents.events.length}`,
+    `- cold raw lines: ${countLines(coldText)}`,
+    '',
+  ].join('\n');
+}
+
+function parseLegacyColdEvents(text, sourcePath, projectId, sessionId) {
+  const lines = String(text || '').split(/\r?\n/).filter((line) => line.trim().length);
+  const events = [];
+  const indexItems = [];
+  let skippedCount = 0;
+  for (const line of lines) {
+    if (looksSensitive(line)) {
+      skippedCount += 1;
+      continue;
+    }
+    let parsed = null;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      parsed = null;
+    }
+    const now = new Date().toISOString();
+    const event = parsed && typeof parsed === 'object'
+      ? {
+          type: 'legacy_cold_import',
+          project_id: projectId,
+          session_id: sessionId,
+          source_path: sourcePath,
+          imported_at: now,
+          payload: parsed,
+        }
+      : {
+          type: 'legacy_cold_import',
+          project_id: projectId,
+          session_id: sessionId,
+          source_path: sourcePath,
+          imported_at: now,
+          summary: line,
+        };
+    events.push(event);
+    indexItems.push({
+      scope: 'project',
+      project_id: projectId,
+      session_id: sessionId,
+      kind: 'legacy_cold_import',
+      title: `Legacy cold import ${sessionId}`,
+      body: compactText(event.summary || JSON.stringify(event.payload || {}), 1600),
+      source_path: sourcePath,
+      created_at: now,
+    });
+  }
+  if (!events.length && text.trim()) {
+    const now = new Date().toISOString();
+    events.push({
+      type: 'legacy_cold_import',
+      project_id: projectId,
+      session_id: sessionId,
+      source_path: sourcePath,
+      imported_at: now,
+      summary: compactText(text, 1600),
+    });
+    indexItems.push({
+      scope: 'project',
+      project_id: projectId,
+      session_id: sessionId,
+      kind: 'legacy_cold_import',
+      title: `Legacy cold import ${sessionId}`,
+      body: compactText(text, 1600),
+      source_path: sourcePath,
+      created_at: now,
+    });
+  }
+  return { events, indexItems, skippedCount };
+}
+
+function stripSensitiveLines(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const kept = [];
+  let skippedCount = 0;
+  for (const line of lines) {
+    if (looksSensitive(line)) {
+      skippedCount += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { text: kept.join('\n').trim(), skippedCount };
+}
+
+function looksSensitive(line) {
+  return /(password|passwd|secret|token|cookie|apikey|api_key|access_key|private_key|redis:\/\/|mysql:\/\/|postgres:\/\/|mongodb:\/\/)/i.test(String(line || ''));
+}
+
+function countLines(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return 0;
+  return trimmed.split(/\r?\n/).length;
+}
+
+function dedupeSearchItems(items) {
+  const seenExact = new Set();
+  const seenRipgrepSources = new Set();
+  const result = [];
+  for (const item of items) {
+    const sourceKey = item.source_path ? path.resolve(item.source_path).toLowerCase() : '';
+    if (item.backend === 'ripgrep' && sourceKey) seenRipgrepSources.add(sourceKey);
+    if (item.backend !== 'ripgrep' && sourceKey && seenRipgrepSources.has(sourceKey)) continue;
+    const key = sourceKey
+      ? `${sourceKey}\0${item.kind}\0${item.title}\0${String(item.body || '').slice(0, 500)}`
+      : `${item.kind}\0${item.title}\0${item.body}`;
+    if (seenExact.has(key)) continue;
+    seenExact.add(key);
+    result.push(item);
+  }
+  return result;
 }
 
 function ensureMarkdownTitle(content, title) {

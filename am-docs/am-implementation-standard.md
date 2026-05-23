@@ -26,8 +26,27 @@
 
 - Markdown：人工可读的规则、上下文和稳定知识。
 - JSONL：追加式历史账本和 checkpoint，禁止覆盖历史。
+- 词法检索：优先使用 `ripgrep` 对 Markdown/JSONL/TOML 源文件做实时精确检索，用于路径、命令、报错、API、配置键、session id 等高精确信息。
 - SQLite FTS：优先使用 FTS5；如果本机 sqlite 不支持 FTS5，则降级为普通 SQLite `LIKE` 检索；如果 sqlite 不可用或索引没有命中，再降级为文件扫描。索引可通过 `am rebuild-index` 重建，不是唯一事实来源。
+- 向量检索：v1 不作为默认主路径。后续可以作为可选召回层，但不能替代词法检索，也不能未经预算裁剪就把大量相似块塞进上下文。
 - Secret Vault：敏感信息独立存储，普通记忆只保存 `secret_ref`。
+
+## 检索策略
+
+- 检索必须先看确定性入口：当前 session hot、active index、项目配置、已知路径。
+- 对代码项目和 agent 记忆，`rg`/FTS/BM25 这类词法检索优先级高于纯向量 RAG。
+- 语义向量适合“我记得意思但不记得原词”的扩展召回，不适合作为查找标识符、路径、命令和错误文本的唯一方式。
+- 合并多个检索源时必须去重，优先保留源文件路径明确、命中词可解释、更新时间更近的结果。
+- 返回 Context Pack 前必须做上下文预算控制，禁止因为命中结果过多而挤掉当前任务状态。
+
+## 热记忆并发模型
+
+- 禁止使用一个项目级 hot 文件代表唯一当前任务。
+- 项目级热状态必须拆成 `am-active.json` 和多个 session hot。
+- `am-active.json` 只记录活跃 session/task/worktree 索引、状态一句话、更新时间和文件路径。
+- 每个 agent/session/task/worktree 独立维护自己的 `am-session.md` 和 `am-checkpoints.jsonl`。
+- 写锁必须短等待并检测 stale lock，防止并发 checkpoint 直接失败；但锁只能防止文件写坏，不能解决任务状态归属冲突，因此不同任务不得互相覆盖 hot。
+- 温记忆和冷记忆仍然项目共享，因为它们保存稳定知识和历史索引，而不是当前任务状态。
 
 ## 规则文件
 
@@ -49,7 +68,7 @@
 
 ## 性能
 
-同步路径只允许轻量操作：读小文件、SQLite FTS、追加 JSONL、写 session checkpoint。LLM 总结、向量化、图谱抽取和长文档重建索引放到后台或后续版本。
+同步路径只允许轻量操作：读小文件、`ripgrep` 小范围检索、SQLite FTS、追加 JSONL、写 session checkpoint。LLM 总结、向量化、图谱抽取和长文档重建索引放到后台或后续版本。
 
 目标：
 

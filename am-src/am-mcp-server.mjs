@@ -1,12 +1,21 @@
 #!/usr/bin/env node
 import {
+  activeComplete,
+  activeList,
+  activeUpdate,
   checkpoint,
+  docCheck,
   doctor,
   getContext,
   promote,
+  migrateLegacy,
   rebuildIndex,
   search,
   secretGet,
+  secretList,
+  secretRemove,
+  secretSet,
+  secretUpdate,
 } from './am-core.mjs';
 
 const tools = {
@@ -16,6 +25,15 @@ const tools = {
   'am.rebuild_index': rebuildIndex,
   'am.search': search,
   'am.secret_get': secretGet,
+  'am.secret_set': secretSet,
+  'am.secret_list': secretList,
+  'am.secret_update': secretUpdate,
+  'am.secret_remove': secretRemove,
+  'am.active_list': activeList,
+  'am.active_update': activeUpdate,
+  'am.active_complete': activeComplete,
+  'am.migrate_legacy': migrateLegacy,
+  'am.doc_check': docCheck,
   'am.doctor': doctor,
 };
 

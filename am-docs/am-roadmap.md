@@ -18,25 +18,40 @@
 
 - 完善 `am init`，支持创建用户配置 `~/.agents-memory/am-config.toml`。
 - 完善 `am register-project`，支持重复注册检测和只追加历史事件。
+- 增加项目级 `am-active.json`，用于索引当前活跃 session/task/worktree；禁止再把项目级 hot 当作唯一当前任务。
+- 完善 `am start-session`，生成语义化 session id，并把 session 注册到 `am-active.json`。
+- 增加 `am active list/update/complete`，用于查看、更新和完成活跃任务索引。
 - 完善 `am install-rules`，支持 Codex、Claude、Cursor 三类规则入口。
 - 完善 `am checkpoint`，支持从 stdin 读取 state，避免长文本命令行转义问题。
 - 完善 `am promote`，增加人工确认模式和 dry-run 模式。
 - 完善 `am rebuild-index`，支持 global/project/session 作用域。
+- 完善 `am search`，形成确定性读取 + `ripgrep` + SQLite FTS/LIKE + 文件扫描的稳定检索链路。
+- 增加 `am doc-check`，用来校验 README、开发说明、用户手册、roadmap 的关键命令同步。
 
 ## 里程碑 3：MCP Server 可用化
 
 - 按 MCP 协议补齐工具 schema、错误结构和能力描述。
 - 提供 Codex、Claude、Cursor 的 MCP 配置示例。
 - 保证 MCP 与 CLI 调用同一套核心逻辑。
-- 增加 MCP smoke test，覆盖 `am.get_context`、`am.checkpoint`、`am.search`。
+- 增加 MCP smoke test，覆盖 `am.get_context`、`am.checkpoint`、`am.search`、`am.active_*`、`am.secret_*`。
 
 ## 里程碑 4：存储与并发加固
 
 - 把锁机制完善为项目级短锁和 Secret 独占锁。
+- 为 `am-active.json` 增加短锁和原子替换，避免并发 agent 更新活跃任务索引时丢条目。
 - 增加 stale lock 检测和安全提示。
 - 增加 JSONL 事件 schema 校验。
 - 增加索引重建和索引损坏恢复测试。
 - 在没有 FTS5 的 Windows sqlite 环境下保证 fallback 检索稳定。
+- 在没有 `ripgrep` 的环境下保证 SQLite/file fallback 检索稳定。
+
+## 里程碑 4.5：检索质量治理
+
+- 把 `doctor` 的 `ripgrep`、`sqlite3`、`sqlite_fts5` 能力检查纳入验收。
+- 增加 search fixture，覆盖路径、命令、错误文本、中文关键词和 session id。
+- 增加检索结果去重和预算裁剪测试，避免 Context Pack 被大量历史命中挤满。
+- 评估可选向量召回插件，但 v1 默认仍坚持词法检索优先。
+- 增加人工可解释的 search debug 输出，显示命中来源、后端和裁剪原因。
 
 ## 里程碑 5：规则文件治理
 
@@ -60,6 +75,7 @@
 - 覆盖规则文件只追加不覆盖。
 - 覆盖删除索引后重建。
 - 覆盖无 sqlite、无 FTS5 的降级路径。
+- 覆盖 `doc-check` 与文档同步约束。
 
 ## 里程碑 8：旧记忆迁移
 
@@ -85,6 +101,6 @@
 
 - 当前实现还是 Node ESM 原型，不是最终 TypeScript 工程形态。
 - MCP server 是最小 stdio 骨架，还未补完整工具 schema。
-- 本机 sqlite3 不支持 FTS5 时会降级为普通 SQLite 和文件扫描。
+- 本机缺少 `ripgrep` 或 sqlite3 不支持 FTS5 时会降级为普通 SQLite 和文件扫描。
 - Secret Vault 当前只实现 `get`，还未实现 `set/list`。
-- `checkpoint --state` 长文本在 PowerShell 中有转义限制，后续应支持 stdin。
+- `checkpoint --state` 长文本在 PowerShell 中有转义限制，后续应支持 stdin 或 `--state-file`。
