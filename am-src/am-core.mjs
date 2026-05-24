@@ -5,8 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const AM_VERSION = '0.1.0';
-export const AM_DEFAULT_IMPLEMENTATION_DATA_ROOT = 'E:\\work\\AM-data';
-export const AM_USER_CONFIG_PATH = path.join(os.homedir(), '.agents-memory', 'am-config.toml');
+export const AM_DEFAULT_USER_DATA_ROOT = path.join(os.homedir(), '.agents-memory', 'am-data');
 
 const AM_MANAGED_BEGIN = '<!-- AM:BEGIN agents-memory v1 -->';
 const AM_MANAGED_END = '<!-- AM:END agents-memory v1 -->';
@@ -29,6 +28,30 @@ export function today() {
 
 export function normalizeSlashes(value) {
   return String(value).replace(/\\/g, path.sep);
+}
+
+export function expandUserPath(value) {
+  const text = String(value ?? '');
+  if (!text) return text;
+  if (text === '~') return os.homedir();
+  if (text.startsWith('~/') || text.startsWith('~\\')) {
+    return path.join(os.homedir(), text.slice(2));
+  }
+  return text;
+}
+
+export function resolvePathLike(value) {
+  return path.resolve(expandUserPath(value));
+}
+
+export function displayConfigPath(value) {
+  const resolved = resolvePathLike(value);
+  if (resolved === AM_DEFAULT_USER_DATA_ROOT) return '~/.agents-memory/am-data';
+  return resolved;
+}
+
+export function getUserConfigPath() {
+  return path.join(os.homedir(), '.agents-memory', 'am-config.toml');
 }
 
 export async function pathExists(filePath) {
@@ -141,15 +164,15 @@ export function renderToml(config) {
 }
 
 export async function loadUserConfig() {
-  const content = await readText(AM_USER_CONFIG_PATH, '');
+  const content = await readText(getUserConfigPath(), '');
   return content ? parseTomlLike(content) : {};
 }
 
 export function resolveAmDataRoot(options = {}, userConfig = {}) {
-  if (options['am-data-root']) return path.resolve(options['am-data-root']);
-  if (process.env.AM_DATA_ROOT) return path.resolve(process.env.AM_DATA_ROOT);
-  if (userConfig.paths?.am_data_root) return path.resolve(userConfig.paths.am_data_root);
-  return AM_DEFAULT_IMPLEMENTATION_DATA_ROOT;
+  if (options['am-data-root']) return resolvePathLike(options['am-data-root']);
+  if (process.env.AM_DATA_ROOT) return resolvePathLike(process.env.AM_DATA_ROOT);
+  if (userConfig.paths?.am_data_root) return resolvePathLike(userConfig.paths.am_data_root);
+  return AM_DEFAULT_USER_DATA_ROOT;
 }
 
 export function expandTemplate(template, values) {
@@ -159,19 +182,22 @@ export function expandTemplate(template, values) {
   });
 }
 
-export function pathsFor(amDataRoot, projectId = undefined, sessionId = undefined, projectRoot = undefined, agentName = undefined) {
+export function pathsFor(amDataRoot, projectId = undefined, sessionId = undefined, projectRoot = undefined, agentName = undefined, pathConfig = {}) {
   const values = {
     am_data_root: amDataRoot,
+    home_dir: os.homedir(),
     project_id: projectId ?? '',
     session_id: sessionId ?? '',
     project_root: projectRoot ?? '',
     agent_name: agentName ?? '',
     date: today(),
   };
-  const globalDir = expandTemplate('{am_data_root}\\am-global', values);
-  const projectsDir = expandTemplate('{am_data_root}\\am-projects', values);
-  const projectDir = projectId ? expandTemplate('{am_data_root}\\am-projects\\{project_id}', values) : undefined;
-  const sessionDir = projectId && sessionId ? expandTemplate('{am_data_root}\\am-projects\\{project_id}\\am-sessions\\{session_id}', values) : undefined;
+  const globalDir = resolvePathLike(expandTemplate(pathConfig.am_global_dir || '{am_data_root}/am-global', values));
+  const projectsDir = resolvePathLike(expandTemplate(pathConfig.am_projects_dir || '{am_data_root}/am-projects', values));
+  const secretsDir = resolvePathLike(expandTemplate(pathConfig.am_secrets_dir || '{am_data_root}/am-secrets', values));
+  const locksDir = resolvePathLike(expandTemplate(pathConfig.am_locks_dir || '{am_data_root}/am-locks', values));
+  const projectDir = projectId ? path.join(projectsDir, projectId) : undefined;
+  const sessionDir = projectId && sessionId ? path.join(projectDir, 'am-sessions', sessionId) : undefined;
   return {
     amDataRoot,
     configFile: path.join(amDataRoot, 'am-config.toml'),
@@ -191,8 +217,8 @@ export function pathsFor(amDataRoot, projectId = undefined, sessionId = undefine
     sessionDir,
     sessionFile: sessionDir ? path.join(sessionDir, 'am-session.md') : undefined,
     checkpointsFile: sessionDir ? path.join(sessionDir, 'am-checkpoints.jsonl') : undefined,
-    secretsDir: path.join(amDataRoot, 'am-secrets'),
-    locksDir: path.join(amDataRoot, 'am-locks'),
+    secretsDir,
+    locksDir,
   };
 }
 
@@ -233,7 +259,7 @@ export async function acquireLock(lockPath, purpose, options = {}) {
 export async function initAm(options = {}) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot);
+  const p = pathsFor(amDataRoot, undefined, undefined, undefined, undefined, userConfig.paths);
   await ensureDir(p.amDataRoot);
   await ensureDir(p.globalMemoryDir);
   await ensureDir(p.globalRulesDir);
@@ -243,11 +269,11 @@ export async function initAm(options = {}) {
   if (!(await pathExists(p.configFile))) {
     await writeTextAtomic(p.configFile, renderToml({
       paths: {
-        am_data_root: p.amDataRoot,
-        am_global_dir: '{am_data_root}\\am-global',
-        am_projects_dir: '{am_data_root}\\am-projects',
-        am_secrets_dir: '{am_data_root}\\am-secrets',
-        am_locks_dir: '{am_data_root}\\am-locks',
+        am_data_root: displayConfigPath(p.amDataRoot),
+        am_global_dir: '{am_data_root}/am-global',
+        am_projects_dir: '{am_data_root}/am-projects',
+        am_secrets_dir: '{am_data_root}/am-secrets',
+        am_locks_dir: '{am_data_root}/am-locks',
       },
     }));
   }
@@ -263,7 +289,7 @@ export async function registerProject(options) {
   await initAm(options);
   const projectId = options.id;
   const projectRoot = path.resolve(options.root);
-  const p = pathsFor(amDataRoot, projectId);
+  const p = pathsFor(amDataRoot, projectId, undefined, undefined, undefined, userConfig.paths);
   const release = await acquireLock(path.join(p.locksDir, `${projectId}.am.lock`), `register project ${projectId}`);
   try {
     await ensureDir(p.projectRulesDir);
@@ -310,7 +336,7 @@ export async function startSession(options) {
   const taskName = options.task || options['task-name'] || '';
   const worktree = options.worktree || options['worktree-root'] || '';
   const sessionId = options.session || `${agentName}-${Date.now()}`;
-  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, agentName);
+  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, agentName, userConfig.paths);
   if (!(await pathExists(p.projectConfig))) {
     throw new AmError(`项目未注册：${projectId}`, 'AM_PROJECT_NOT_FOUND');
   }
@@ -361,7 +387,7 @@ export async function checkpoint(options) {
   const projectId = options.project;
   const sessionId = options.session;
   const reason = options.reason || 'checkpoint';
-  const p = pathsFor(amDataRoot, projectId, sessionId);
+  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, undefined, userConfig.paths);
   const state = await readCheckpointState(options);
   const sessionText = state || await readText(p.sessionFile, '');
   const release = await acquireLock(path.join(p.locksDir, `${projectId}.am.lock`), `checkpoint ${projectId}/${sessionId}`);
@@ -413,7 +439,7 @@ export async function promote(options) {
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
   const sessionId = options.session;
-  const p = pathsFor(amDataRoot, projectId, sessionId);
+  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, undefined, userConfig.paths);
   const release = await acquireLock(path.join(p.locksDir, `${projectId}.am.lock`), `promote ${projectId}/${sessionId}`);
   try {
     const sessionText = await readText(p.sessionFile, '');
@@ -473,7 +499,7 @@ export async function getContext(options) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
-  const p = pathsFor(amDataRoot, projectId, sessionId);
+  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, undefined, userConfig.paths);
   const projectRules = await readText(path.join(p.projectRulesDir, 'am-rules.md'), '');
   const activeIndex = await readText(p.projectActiveFile, '');
   const warm = await readText(path.join(p.projectMemoryDir, 'am-warm.md'), '');
@@ -509,7 +535,7 @@ export async function search(options) {
   const debug = Boolean(options.debug);
   const scopes = String(options.scope || 'global,project').split(',').map((scope) => scope.trim());
   const projectId = options.project;
-  const p = pathsFor(amDataRoot, projectId);
+  const p = pathsFor(amDataRoot, projectId, undefined, undefined, undefined, userConfig.paths);
   const indexFiles = [];
   const searchDirs = [];
   if (scopes.includes('global')) {
@@ -554,7 +580,7 @@ export async function rebuildIndex(options) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
-  const p = pathsFor(amDataRoot, projectId);
+  const p = pathsFor(amDataRoot, projectId, undefined, undefined, undefined, userConfig.paths);
   if (!(await pathExists(p.projectDir))) {
     throw new AmError(`项目未注册：${projectId}`, 'AM_PROJECT_NOT_FOUND');
   }
@@ -644,7 +670,7 @@ export async function secretRemove(options) {
 export async function doctor(options = {}) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot, options.project);
+  const p = pathsFor(amDataRoot, options.project, undefined, undefined, undefined, userConfig.paths);
   const checks = [];
   checks.push(await checkPath('am_data_root', p.amDataRoot));
   checks.push(await checkPath('am_global', p.globalDir));
@@ -671,7 +697,7 @@ export async function migrateLegacy(options) {
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
   const sessionId = options.session;
-  const p = pathsFor(amDataRoot, projectId, sessionId);
+  const p = pathsFor(amDataRoot, projectId, sessionId, undefined, undefined, userConfig.paths);
   if (!(await pathExists(p.projectConfig))) {
     throw new AmError(`项目未注册：${projectId}`, 'AM_PROJECT_NOT_FOUND');
   }
@@ -802,7 +828,7 @@ export async function activeList(options) {
   requireOption(options, 'project');
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot, options.project);
+  const p = pathsFor(amDataRoot, options.project, undefined, undefined, undefined, userConfig.paths);
   const index = await loadActiveIndex(p.projectActiveFile, options.project);
   return { projectId: options.project, updatedAt: index.updated_at || '', entries: index.entries || [] };
 }
@@ -812,7 +838,7 @@ export async function activeUpdate(options) {
   requireOption(options, 'session');
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot, options.project, options.session);
+  const p = pathsFor(amDataRoot, options.project, options.session, undefined, undefined, userConfig.paths);
   const now = new Date().toISOString();
   const entry = await upsertActiveEntry(p, {
     project_id: options.project,
@@ -834,7 +860,7 @@ export async function activeComplete(options) {
   requireOption(options, 'session');
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot, options.project, options.session);
+  const p = pathsFor(amDataRoot, options.project, options.session, undefined, undefined, userConfig.paths);
   const now = new Date().toISOString();
   const entry = await upsertActiveEntry(p, {
     project_id: options.project,
@@ -1230,7 +1256,7 @@ async function loadJson(filePath, fallback = {}) {
 async function lockAndLoadSecretStore(options, purpose) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot);
+  const p = pathsFor(amDataRoot, undefined, undefined, undefined, undefined, userConfig.paths);
   const secretFile = path.join(p.secretsDir, 'am-secrets.local.json');
   await ensureDir(p.secretsDir);
   const release = await acquireLock(path.join(p.locksDir, 'am-secrets.am.lock'), purpose);
@@ -1241,7 +1267,7 @@ async function lockAndLoadSecretStore(options, purpose) {
 async function loadSecretStore(options) {
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
-  const p = pathsFor(amDataRoot);
+  const p = pathsFor(amDataRoot, undefined, undefined, undefined, undefined, userConfig.paths);
   const secretFile = path.join(p.secretsDir, 'am-secrets.local.json');
   const store = await loadJson(secretFile, {});
   return { secretFile, store };

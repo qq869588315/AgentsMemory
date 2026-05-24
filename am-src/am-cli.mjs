@@ -114,9 +114,9 @@ function helpText() {
   return `agents-memory CLI
 
 Usage:
-  node am-src/am-cli.mjs init --am-data-root E:\\work\\AM-data
-  node am-src/am-cli.mjs register-project --id sdcr --root E:\\workspace\\company_jz\\sdcr
-  node am-src/am-cli.mjs install-rules --target codex --project sdcr --root E:\\workspace\\company_jz\\sdcr
+  am init
+  am register-project --id <project-id> --root <project-root>
+  am install-rules --target codex --project <project-id> --root <project-root>
   node am-src/am-cli.mjs start-session --project sdcr --agent codex
   node am-src/am-cli.mjs get-context --project sdcr --session <id> --query "..."
   node am-src/am-cli.mjs checkpoint --project sdcr --session <id> --reason pre-compact --state "..."
@@ -137,6 +137,6 @@ Path priority:
   1. --am-data-root
   2. AM_DATA_ROOT
   3. ~/.agents-memory/am-config.toml
-  4. E:\\work\\AM-data
+  4. ~/.agents-memory/am-data
 `;
 }

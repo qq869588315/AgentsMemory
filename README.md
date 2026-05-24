@@ -1,4 +1,4 @@
-# agents-memory
+﻿# agents-memory
 
 Local-first memory runtime for AI agents.
 
@@ -11,14 +11,14 @@ Local-first memory runtime for AI agents.
 ## Quick Start
 
 ```powershell
-node am-src/am-cli.mjs init --am-data-root E:\work\AM-data
-node am-src/am-cli.mjs register-project --id sdcr --root E:\workspace\company_jz\sdcr
-node am-src/am-cli.mjs start-session --project sdcr --agent codex
-node am-src/am-cli.mjs checkpoint --project sdcr --session <session-id> --reason pre-compact --state "当前任务状态"
-node am-src/am-cli.mjs active list --project sdcr
-node am-src/am-cli.mjs secret set --ref sdcr.mysql.dev --value "..."
-node am-src/am-cli.mjs migrate legacy --project sdcr --session imported-legacy --hot <hot.md> --warm <warm.md> --cold <cold.md>
-node am-src/am-cli.mjs rebuild-index --project sdcr
+am init
+am register-project --id <project-id> --root <project-root>
+am start-session --project <project-id> --agent codex
+am checkpoint --project <project-id> --session <session-id> --reason pre-compact --state "当前任务状态"
+am active list --project <project-id>
+am secret set --ref <secret-ref> --value "..."
+am migrate legacy --project <project-id> --session imported-legacy --hot <hot.md> --warm <warm.md> --cold <cold.md>
+am rebuild-index --project <project-id>
 ```
 
 The data path can be configured by CLI argument, `AM_DATA_ROOT`, or `~/.agents-memory/am-config.toml`.
