@@ -11,4 +11,5 @@ am-backups/
 am-data/
 am-secrets/
 am-locks/
+am-tests/.tmp/
 *.am-tmp-*

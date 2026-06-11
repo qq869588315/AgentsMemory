@@ -36,7 +36,21 @@ am init
 am register-project --id <project-id> --root <project-root>
 am start-session --project <project-id> --agent codex
 am checkpoint --project <project-id> --session <session-id> --reason pre-compact --state "当前任务状态"
-am get-context --project <project-id> --session <session-id> --query "我要处理的问题"
+am get-context --project <project-id> --session <session-id> --query "我要处理的问题" --profile lean
+```
+
+## 上下文档位
+
+`am get-context` 支持 `--profile lean|normal|deep` 来控制注入上下文的长度。
+
+- `lean`：省 token 模式，默认 3 条检索命中，跳过完整 warm memory，只保留短规则、active 摘要和 session 状态。
+- `normal`：折中模式，默认 5 条检索命中，保留较短 warm memory。
+- `deep`：完整模式，也是默认值，保持原有上下文预算和默认 8 条检索命中。
+
+仍然可以用 `--limit <n>` 覆盖检索命中数量，例如：
+
+```powershell
+am get-context --project <project-id> --session <session-id> --query "登录失败" --profile lean --limit 3
 ```
 
 ## 常用命令

@@ -118,7 +118,7 @@ Usage:
   am register-project --id <project-id> --root <project-root>
   am install-rules --target codex --project <project-id> --root <project-root>
   node am-src/am-cli.mjs start-session --project sdcr --agent codex
-  node am-src/am-cli.mjs get-context --project sdcr --session <id> --query "..."
+  node am-src/am-cli.mjs get-context --project sdcr --session <id> --query "..." --profile lean
   node am-src/am-cli.mjs checkpoint --project sdcr --session <id> --reason pre-compact --state "..."
   node am-src/am-cli.mjs promote --project sdcr --session <id>
   node am-src/am-cli.mjs rebuild-index --project sdcr

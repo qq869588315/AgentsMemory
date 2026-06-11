@@ -496,15 +496,24 @@ export async function getContext(options) {
   requireOption(options, 'project');
   const query = options.query || '';
   const sessionId = options.session;
+  const { profile, settings } = resolveContextProfile(options);
+  const searchLimit = resolvePositiveInteger(options.limit, settings.searchLimit);
   const userConfig = await loadUserConfig();
   const amDataRoot = resolveAmDataRoot(options, userConfig);
   const projectId = options.project;
   const p = pathsFor(amDataRoot, projectId, sessionId, undefined, undefined, userConfig.paths);
-  const projectRules = await readText(path.join(p.projectRulesDir, 'am-rules.md'), '');
-  const activeIndex = await readText(p.projectActiveFile, '');
-  const warm = await readText(path.join(p.projectMemoryDir, 'am-warm.md'), '');
-  const session = sessionId ? await readText(p.sessionFile, '') : '';
-  const results = await search({ ...options, scope: 'global,project', query, limit: options.limit || 8 });
+  let projectRules = await readText(path.join(p.projectRulesDir, 'am-rules.md'), '');
+  let activeIndex = await readText(p.projectActiveFile, '');
+  let warm = await readText(path.join(p.projectMemoryDir, 'am-warm.md'), '');
+  let session = sessionId ? await readText(p.sessionFile, '') : '';
+  const results = await search({ ...options, scope: 'global,project', query, limit: searchLimit });
+  projectRules = compactText(projectRules, settings.rulesBudget);
+  activeIndex = compactText(settings.activeRaw ? activeIndex : summarizeActiveIndex(activeIndex, sessionId, settings.activeEntries), settings.activeBudget);
+  session = compactText(session, settings.sessionBudget);
+  warm = settings.warmBudget > 0
+    ? compactText(warm, settings.warmBudget)
+    : `- skipped by profile "${profile}"; use --profile normal or --profile deep for project warm memory.`;
+  results.items = results.items.map((item) => ({ ...item, body: compactText(item.body, settings.hitBudget) }));
   const context = [
     '# agents-memory Context Pack',
     '',
@@ -524,7 +533,89 @@ export async function getContext(options) {
     results.items.map((item, index) => `${index + 1}. [${item.kind}] ${item.title}\n   source: ${item.source_path}\n   ${compactText(item.body, 600)}`).join('\n') || '- 无命中。',
     '',
   ].join('\n');
-  return { projectId, sessionId, query, context: compactText(context, 20000), hits: results.items };
+  return { projectId, sessionId, query, profile, context: compactText(context, settings.contextBudget), hits: results.items };
+}
+
+const CONTEXT_PROFILES = {
+  lean: {
+    rulesBudget: 1200,
+    activeBudget: 900,
+    activeEntries: 5,
+    activeRaw: false,
+    sessionBudget: 2400,
+    warmBudget: 0,
+    searchLimit: 3,
+    hitBudget: 300,
+    contextBudget: 6000,
+  },
+  normal: {
+    rulesBudget: 2000,
+    activeBudget: 1500,
+    activeEntries: 8,
+    activeRaw: false,
+    sessionBudget: 3500,
+    warmBudget: 2500,
+    searchLimit: 5,
+    hitBudget: 500,
+    contextBudget: 12000,
+  },
+  deep: {
+    rulesBudget: 3000,
+    activeBudget: 3000,
+    activeEntries: 0,
+    activeRaw: true,
+    sessionBudget: 4000,
+    warmBudget: 5000,
+    searchLimit: 8,
+    hitBudget: 600,
+    contextBudget: 20000,
+  },
+};
+
+function resolveContextProfile(options) {
+  const rawProfile = options.profile || options['context-profile'] || options.contextProfile || 'deep';
+  const profile = String(rawProfile).trim().toLowerCase();
+  if (!CONTEXT_PROFILES[profile]) {
+    throw new AmError(`Unsupported context profile: ${rawProfile}. Use lean, normal, or deep.`, 'AM_BAD_CONTEXT_PROFILE');
+  }
+  return { profile, settings: CONTEXT_PROFILES[profile] };
+}
+
+function resolvePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function summarizeActiveIndex(activeIndexText, sessionId, maxEntries) {
+  const raw = String(activeIndexText || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+    if (!entries.length) return '';
+    const ordered = [...entries].sort((a, b) => {
+      const aCurrent = sessionId && a.session_id === sessionId ? 1 : 0;
+      const bCurrent = sessionId && b.session_id === sessionId ? 1 : 0;
+      if (aCurrent !== bCurrent) return bCurrent - aCurrent;
+      const aActive = a.status === 'active' ? 1 : 0;
+      const bActive = b.status === 'active' ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      return String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
+    });
+    const limited = maxEntries > 0 ? ordered.slice(0, maxEntries) : ordered;
+    return limited.map((entry) => {
+      const parts = [
+        `session=${entry.session_id || ''}`,
+        `status=${entry.status || ''}`,
+        entry.task ? `task=${entry.task}` : '',
+        entry.summary ? `summary=${entry.summary}` : '',
+        entry.updated_at ? `updated=${entry.updated_at}` : '',
+      ].filter(Boolean);
+      return `- ${parts.join(' | ')}`;
+    }).join('\n');
+  } catch {
+    return raw;
+  }
 }
 
 export async function search(options) {
@@ -814,6 +905,7 @@ export async function docCheck() {
     ['doc-check', ['README.md', 'am-docs/am-developer-guide.md', 'am-docs/am-user-manual.md', 'am-docs/am-roadmap.md']],
     ['state-file', ['am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md', 'am-docs/am-roadmap.md']],
     ['ripgrep', ['am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md', 'am-docs/am-implementation-standard.md']],
+    ['profile lean', ['README.md', 'am-docs/am-user-manual.md', 'am-docs/am-developer-guide.md']],
   ];
   const missing = [];
   for (const [needle, candidateFiles] of requirements) {

@@ -67,7 +67,17 @@ CLI 和 MCP server 都只是入口层，新增命令时必须复用 `am-core` �
 - doctor 检查
 - secret vault
 - legacy migration
+- get-context profile 预算裁剪
 - `ripgrep` 优先检索和 SQLite/file fallback 协调
+
+### Context Profile
+
+`getContext` 支持 `--profile lean|normal|deep`：
+- `lean` 用于省 token，默认 3 条检索命中，跳过完整 warm memory，并把 active index 转成短摘要。
+- `normal` 用于普通接手，默认 5 条检索命中，保留较短 warm memory。
+- `deep` 是默认值，保持旧版接近完整的上下文预算，避免破坏现有调用。
+
+新增或调整 profile 预算时，必须同步更新用户手册，并补充 smoke test 覆盖输出长度差异。
 
 ### 规则文件写入
 

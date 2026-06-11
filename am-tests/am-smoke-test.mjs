@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import {
   activeComplete,
@@ -25,7 +24,9 @@ import {
   resolveAmDataRoot,
 } from '../am-src/am-core.mjs';
 
-const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'am-test-'));
+const tempBase = path.resolve('am-tests', '.tmp');
+await fs.mkdir(tempBase, { recursive: true });
+const tempRoot = await fs.mkdtemp(path.join(tempBase, 'am-test-'));
 const dataRoot = path.join(tempRoot, 'am-data');
 const projectRoot = path.join(tempRoot, 'project');
 await fs.mkdir(projectRoot, { recursive: true });
@@ -72,13 +73,33 @@ assert.match(rulesContent, /AM:BEGIN agents-memory v1/);
 const backups = await fs.readdir(path.join(projectRoot, 'am-backups'));
 assert.equal(backups.length, 1);
 
+const warmPath = path.join(dataRoot, 'am-projects', 'demo', 'am-memory', 'am-warm.md');
+await fs.appendFile(
+  warmPath,
+  `\n## Token Budget Fixture\n\n${Array.from({ length: 80 }, (_, index) => `- warm-memory-line-${index}: checkpoint token budget fixture`).join('\n')}\n`,
+  'utf8',
+);
+
 const context = await getContext({
   'am-data-root': dataRoot,
   project: 'demo',
   session: session.sessionId,
   query: 'checkpoint',
 });
+assert.equal(context.profile, 'deep');
 assert.match(context.context, /agents-memory Context Pack/);
+assert.match(context.context, /Token Budget Fixture/);
+
+const leanContext = await getContext({
+  'am-data-root': dataRoot,
+  project: 'demo',
+  session: session.sessionId,
+  query: 'checkpoint',
+  profile: 'lean',
+});
+assert.equal(leanContext.profile, 'lean');
+assert.match(leanContext.context, /skipped by profile "lean"/);
+assert.ok(leanContext.context.length < context.context.length);
 
 const searchResult = await search({ 'am-data-root': dataRoot, project: 'demo', scope: 'project', query: 'checkpoint' });
 assert.ok(Array.isArray(searchResult.items));
@@ -113,4 +134,12 @@ const coldContent = await fs.readFile(coldPath, 'utf8');
 assert.match(coldContent, /checkpoint/);
 assert.match(coldContent, /promote/);
 
-console.log(JSON.stringify({ ok: true, tempRoot, sessionId: session.sessionId }, null, 2));
+console.log(JSON.stringify({
+  ok: true,
+  tempRoot,
+  sessionId: session.sessionId,
+  contextLengths: {
+    deep: context.context.length,
+    lean: leanContext.context.length,
+  },
+}, null, 2));
